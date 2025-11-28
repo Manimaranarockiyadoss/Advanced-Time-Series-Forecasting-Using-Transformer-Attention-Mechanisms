@@ -1,0 +1,220 @@
+
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from math import sqrt
+import math
+
+# ================================================================
+# (1) Generate Synthetic Time Series Dataset (6000 points)
+# ================================================================
+def generate_synthetic_timeseries(n=6000):
+    np.random.seed(42)
+    time = np.arange(n)
+
+    trend = 0.001 * time
+    seasonal = 2 * np.sin(time * 2 * np.pi / 365)
+    noise = np.random.normal(0, 0.3, n)
+
+    series = 10 + trend + seasonal + noise
+    return series.astype(np.float32)
+
+series = generate_synthetic_timeseries()
+
+# ================================================================
+# (2) Dataset Class
+# ================================================================
+class TimeSeriesDataset(Dataset):
+    def _init_(self, series, window_size, horizon):
+        self.series = series
+        self.window = window_size
+        self.horizon = horizon
+
+    def _len_(self):
+        return len(self.series) - self.window - self.horizon
+
+    def _getitem_(self, idx):
+        x = self.series[idx : idx + self.window]
+        y = self.series[idx + self.window : idx + self.window + self.horizon]
+        return torch.tensor(x).unsqueeze(-1), torch.tensor(y)
+
+# ================================================================
+# (3) Positional Encoding
+# ================================================================
+class PositionalEncoding(nn.Module):
+    def _init_(self, d_model, max_len=5000):
+        super()._init_()
+        pe = torch.zeros(max_len, d_model)
+        pos = torch.arange(0, max_len).unsqueeze(1)
+        div = torch.exp(torch.arange(0, d_model, 2) * -(math.log(10000.0)/d_model))
+
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+
+        self.pe = pe.unsqueeze(0)
+
+    def forward(self, x):
+        return x + self.pe[:, :x.size(1)]
+
+# ================================================================
+# (4) Transformer Model
+# ================================================================
+class TransformerForecastModel(nn.Module):
+    def _init_(self, d_model=64, nhead=4, num_layers=3, ff_dim=128, horizon=7):
+        super()._init_()
+        self.input_fc = nn.Linear(1, d_model)
+        self.pos = PositionalEncoding(d_model)
+
+        layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=ff_dim,
+            batch_first=True
+        )
+
+        self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
+        self.output_fc = nn.Linear(d_model, horizon)
+
+    def forward(self, x):
+        x = self.input_fc(x)
+        x = self.pos(x)
+        x = self.encoder(x)
+        x = x[:, -1, :]
+        return self.output_fc(x)
+
+# ================================================================
+# (5) LSTM Baseline Model
+# ================================================================
+class LSTMModel(nn.Module):
+    def _init_(self, hidden=64, horizon=7):
+        super()._init_()
+        self.lstm = nn.LSTM(1, hidden, batch_first=True)
+        self.fc = nn.Linear(hidden, horizon)
+
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        out = out[:, -1, :]
+        return self.fc(out)
+
+# ================================================================
+# (6) Training Function
+# ================================================================
+def train_model(model, loader, epochs=20, lr=0.001):
+    model.train()
+    optim = torch.optim.Adam(model.parameters(), lr=lr)
+    loss_fn = nn.MSELoss()
+
+    for epoch in range(epochs):
+        total_loss = 0
+        for x, y in loader:
+            optim.zero_grad()
+            pred = model(x)
+            loss = loss_fn(pred, y)
+            loss.backward()
+            optim.step()
+            total_loss += loss.item()
+
+        print(f"Epoch {epoch+1}/{epochs}, Loss = {total_loss/len(loader):.4f}")
+
+# ================================================================
+# (7) Evaluation Function
+# ================================================================
+def evaluate(model, loader):
+    model.eval()
+    preds, trues = [], []
+
+    with torch.no_grad():
+        for x, y in loader:
+            pred = model(x)
+            preds.append(pred.numpy())
+            trues.append(y.numpy())
+
+    preds = np.vstack(preds)
+    trues = np.vstack(trues)
+
+    mae = mean_absolute_error(trues, preds)
+    rmse = sqrt(mean_squared_error(trues, preds))
+    mape = np.mean(np.abs((trues - preds) / trues)) * 100
+
+    return mae, rmse, mape
+
+# ================================================================
+# (8) Train/Test Split and DataLoaders
+# ================================================================
+window = 64
+horizon = 7
+
+train_data = series[:5500]
+test_data = series[5500 - window:]
+
+train_ds = TimeSeriesDataset(train_data, window, horizon)
+test_ds = TimeSeriesDataset(test_data, window, horizon)
+
+train_loader = DataLoader(train_ds, batch_size=32, shuffle=True)
+test_loader = DataLoader(test_ds, batch_size=32)
+
+# ================================================================
+# (9) Train Transformer
+# ================================================================
+print("\n=== TRAINING TRANSFORMER MODEL ===")
+transformer = TransformerForecastModel()
+train_model(transformer, train_loader, epochs=25)
+
+mae_t, rmse_t, mape_t = evaluate(transformer, test_loader)
+print("\nTransformer Performance:")
+print(" MAE :", mae_t)
+print(" RMSE:", rmse_t)
+print(" MAPE:", mape_t)
+
+# ================================================================
+# (10) Train LSTM Baseline
+# ================================================================
+print("\n=== TRAINING BASELINE LSTM MODEL ===")
+lstm = LSTMModel()
+train_model(lstm, train_loader, epochs=15)
+
+mae_l, rmse_l, mape_l = evaluate(lstm, test_loader)
+print("\nBaseline LSTM Performance:")
+print(" MAE :", mae_l)
+print(" RMSE:", rmse_l)
+print(" MAPE:", mape_l)
+
+# ================================================================
+# (11) Ablation Study – Varying Attention Heads
+# ================================================================
+def ablation_attention_heads(heads_list=[2, 4, 8]):
+    print("\n=== Ablation Study: Attention Heads ===")
+    results = {}
+    for h in heads_list:
+        print(f"\nTesting {h} heads:")
+        model = TransformerForecastModel(nhead=h)
+        train_model(model, train_loader, epochs=10)
+        mae, rmse, mape = evaluate(model, test_loader)
+        results[h] = (mae, rmse, mape)
+        print(f" Results -> MAE:{mae}, RMSE:{rmse}, MAPE:{mape}")
+    return results
+
+attention_results = ablation_attention_heads()
+
+# ================================================================
+# (12) Ablation Study – Varying Window Sizes
+# ================================================================
+def ablation_window(window_sizes=[32, 64, 128]):
+    print("\n=== Ablation Study: Window Sizes ===")
+    results = {}
+    for w in window_sizes:
+        print(f"\nTesting window size {w}:")
+        ds = TimeSeriesDataset(series, w, horizon)
+        loader = DataLoader(ds, batch_size=32)
+        model = TransformerForecastModel()
+        train_model(model, loader, epochs=10)
+        mae, rmse, mape = evaluate(model, loader)
+        results[w] = (mae, rmse, mape)
+        print(f" Results -> MAE:{mae}, RMSE:{rmse}, MAPE:{mape}")
+    return results
+
+window_results = ablation_window()
